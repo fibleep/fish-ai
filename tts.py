@@ -1,171 +1,110 @@
 import os
 import threading
 import time
-from functools import lru_cache
-from typing import Dict, List, Tuple, Optional
 import numpy as np
 import sounddevice as sd
 import torch
-from rich.console import Console
-from rich.live import Live
-from rich.text import Text
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
 from datasets import load_dataset
-import nltk
-from nltk.tokenize import sent_tokenize, word_tokenize
-import serial
-import subprocess
-import json
-import re
-from queue import Queue
+from nltk.tokenize import sent_tokenize
+import librosa
 from tooling import Tooling
-
+from rich.console import Console
 
 class TTSService:
-    def __init__(self, device: str = None):
-        self.console = Console(stderr=True)
-        self.console.print("[yellow]Initializing Integrated TTS engine...")
+    def __init__(self):
+        self.console = Console()
+        self.console.print("[cyan]Initializing TTS Service...[/cyan]")
+        
+        # Set sample rates first
+        self.model_sample_rate = 16000
+        self.device_sample_rate = 48000
+        
+        # Configure audio devices
+        self.find_and_set_devices()
         
         # Initialize Tooling
-        self.tooling = Tooling()
+        try:
+            self.console.print("\n[cyan]Initializing Arduino tooling...[/cyan]")
+            self.tooling = Tooling()
+        except Exception as e:
+            self.console.print(f"[red]Error initializing tooling: {e}[/red]")
+            raise
         
         # Initialize TTS components
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.console.print("\n[cyan]Loading TTS models...[/cyan]")
+        self.device = "cpu"
         self.processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts", cache_dir=".model_cache")
-        self.model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts", torch_dtype=torch.float16 if self.device == "cuda" else torch.float32, cache_dir=".model_cache").to(self.device)
-        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan", torch_dtype=torch.float16 if self.device == "cuda" else torch.float32, cache_dir=".model_cache").to(self.device)
+        self.model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts", cache_dir=".model_cache").to(self.device)
+        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan", cache_dir=".model_cache").to(self.device)
         
         dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation", cache_dir=".model_cache")
-        self.speaker_embeddings = torch.tensor(dataset[7306]["xvector"], dtype=torch.float16 if self.device == "cuda" else torch.float32).unsqueeze(0).to(self.device)
+        self.speaker_embeddings = torch.tensor(dataset[7306]["xvector"]).unsqueeze(0).to(self.device)
+        
+        self.console.print("[green]Initialization complete![/green]")
 
-        self.model.eval()
-        self.vocoder.eval()
+    def find_and_set_devices(self):
+        """Automatically find and configure the correct audio devices"""
+        devices = sd.query_devices()
+        self.console.print("\n[yellow]Available Audio Devices:[/yellow]")
         
-        self.sample_rate = 16000
-        self._stop_event = threading.Event()
-        self._audio_cache = {}
+        # Print all devices
+        for i, device in enumerate(devices):
+            device_type = []
+            if device['max_input_channels'] > 0:
+                device_type.append('INPUT')
+            if device['max_output_channels'] > 0:
+                device_type.append('OUTPUT')
+            
+            self.console.print(f"[cyan]{i}:[/cyan] {device['name']} "
+                             f"({', '.join(device_type)}) "
+                             f"- Default SR: {device['default_samplerate']}")
+
+        # Find UACDemo device automatically
+        self.output_device = None
+        for i, device in enumerate(devices):
+            if "UACDemoV1.0" in device['name'] and device['max_output_channels'] > 0:
+                self.output_device = i
+                self.console.print(f"\n[green]Found UACDemo device at index {i}[/green]")
+                break
+
+        if self.output_device is None:
+            self.console.print("[yellow]UACDemo device not found, using default output[/yellow]")
+            self.output_device = sd.default.device[1]
+            
+        # Configure audio settings
+        device_info = sd.query_devices(self.output_device)
+        sd.default.device = (None, self.output_device)  # Only set output device
+        sd.default.samplerate = self.device_sample_rate
+        sd.default.channels = (1, 2)  # Mono input, stereo output
+        sd.default.dtype = ('int16', 'float32')
         
-        self.console.print("[green]Integrated TTS Service initialized successfully!")
+        self.console.print(f"[green]Using output device: {device_info['name']}[/green]")
+        self.console.print(f"[green]Sample rate: {self.device_sample_rate} Hz[/green]")
 
     def process_and_speak(self, text: str):
         """Process text with tools and synthesize speech"""
-        # Extract tools and clean text
-        cleaned_text, tool_positions = self.tooling.extract_tools(text)
-        
-        # Create list of actions with their timing positions
-        actions = [(pos, tool) for tool, pos in tool_positions.items()]
-        actions.sort()
-        
-        print(f"\nFound {len(actions)} actions in text")
-        for pos, tool in actions:
-            print(f"Position {pos}: {tool}")
-        
-        # Generate audio first
-        with torch.inference_mode():
-            audio = self._text_to_audio(cleaned_text)
-        
-        total_duration = len(audio) / self.sample_rate
-        char_to_time_ratio = total_duration / len(cleaned_text)
-        
-        # Calculate action timings and ensure end actions have proper timing
-        action_timings = []
-        for pos, tool in actions:
-            # If action is near the end, make sure it still executes
-            action_time = min(pos * char_to_time_ratio, total_duration - 0.5)
-            action_timings.append((action_time, tool))
-            print(f"Scheduled {tool} at {action_time:.2f} seconds")
-
         try:
-            # Initialize state
-            is_mouth_open = False
-            is_action_in_progress = False
+            # Extract tools and clean text
+            cleaned_text, tool_positions = self.tooling.extract_tools(text)
             
-            # Start playback
-            sd.play(audio, self.sample_rate, blocking=False)
-            start_time = time.time()
+            # Create list of actions with their timing positions
+            actions = [(pos, tool) for tool, pos in tool_positions.items()]
+            actions.sort()
             
-            action_idx = 0
-            last_amplitude_check = 0
+            self.console.print(f"\nFound {len(actions)} actions in text")
+            for pos, tool in actions:
+                self.console.print(f"Position {pos}: {tool}")
             
-            while sd.get_stream().active or action_idx < len(action_timings):  # Keep running until all actions are done
-                current_time = time.time() - start_time
-                
-                # Handle scheduled actions
-                while action_idx < len(action_timings):
-                    action_time, tool = action_timings[action_idx]
-                    
-                    # If it's time for the next action
-                    if current_time >= action_time:
-                        print(f"\nExecuting action {tool} at {current_time:.2f}s")
-                        
-                        # Close mouth if needed before action
-                        if is_mouth_open:
-                            self.tooling.run_tool("MouthClose")
-                            is_mouth_open = False
-                            time.sleep(0.1)
-                        
-                        # Execute the action
-                        is_action_in_progress = True
-                        self.tooling.run_tool(tool)
-                        
-                        # For flop actions, wait for completion
-                        if tool in ["TailFlop", "HeadFlop"]:
-                            time.sleep(0.3)  # Wait for flop to complete
-                        
-                        action_idx += 1
-                        is_action_in_progress = False
-                        continue
-                    break
-                
-                # Only handle mouth movements if audio is still playing
-                if sd.get_stream().active and not is_action_in_progress:
-                    chunk_start = int(current_time * self.sample_rate)
-                    chunk_end = chunk_start + int(0.05 * self.sample_rate)
-                    
-                    if chunk_end < len(audio):
-                        amplitude = np.sqrt(np.mean(audio[chunk_start:chunk_end]**2))
-                        
-                        # Check next action timing
-                        next_action_time = action_timings[action_idx][0] if action_idx < len(action_timings) else float('inf')
-                        
-                        # Only move mouth if we're not too close to next action
-                        if current_time < (next_action_time - 0.2):
-                            if amplitude > 0.1 and not is_mouth_open:
-                                self.tooling.run_tool("MouthOpen")
-                                is_mouth_open = True
-                            elif amplitude <= 0.1 and is_mouth_open:
-                                self.tooling.run_tool("MouthClose")
-                                is_mouth_open = False
-                    
-                    last_amplitude_check = current_time
-                
-                time.sleep(0.01)
-            
-            # Ensure mouth is closed at the end
-            if is_mouth_open:
-                self.tooling.run_tool("MouthClose")
-            
-        except Exception as e:
-            print(f"Error during playback: {e}")
-        finally:
-            try:
-                # More robust cleanup
-                if is_mouth_open:
-                    self.tooling.run_tool("MouthClose")
-                self.tooling.reset_state()
-            except Exception as e:
-                print(f"Error during final cleanup: {e}")
-
-    def _text_to_audio(self, text: str) -> np.ndarray:
-        """Convert text to audio"""
-        try:
-            sentences = sent_tokenize(text)
+            # Generate audio first
+            self.console.print("\n[cyan]Generating speech...[/cyan]")
+            sentences = sent_tokenize(cleaned_text)
             audio_chunks = []
             
             for sentence in sentences:
                 if not sentence.strip():
                     continue
-
+                
                 inputs = self.processor(text=sentence, return_tensors="pt")
                 speech = self.model.generate_speech(
                     inputs["input_ids"].to(self.device), 
@@ -174,22 +113,77 @@ class TTSService:
                 )
                 audio_chunk = speech.cpu().numpy()
                 audio_chunks.append(audio_chunk)
-
+            
             audio = np.concatenate(audio_chunks)
             audio = audio / (np.abs(audio).max() + 1e-6)
-            return audio
-
+            
+            # Resample to match device
+            self.console.print("[cyan]Resampling audio...[/cyan]")
+            audio = librosa.resample(audio, orig_sr=self.model_sample_rate, target_sr=self.device_sample_rate)
+            
+            # Ensure audio is in the correct format and volume
+            audio = audio.astype(np.float32)
+            audio = audio * 2  # Adjust volume
+            
+            total_duration = len(audio) / self.device_sample_rate
+            char_to_time_ratio = total_duration / len(cleaned_text)
+            
+            # Calculate action timings
+            action_timings = []
+            for pos, tool in actions:
+                action_time = min(pos * char_to_time_ratio, total_duration - 0.5)
+                action_timings.append((action_time, tool))
+                self.console.print(f"Scheduled {tool} at {action_time:.2f} seconds")
+            
+            self.console.print(f"\n[cyan]Audio info:[/cyan]")
+            self.console.print(f"Duration: {total_duration:.2f} seconds")
+            self.console.print(f"Sample rate: {self.device_sample_rate} Hz")
+            self.console.print(f"Shape: {audio.shape}")
+            self.console.print(f"Data type: {audio.dtype}")
+            self.console.print(f"Value range: {audio.min():.3f} to {audio.max():.3f}")
+            
+            # Start playback
+            self.console.print("\n[green]Starting playback...[/green]")
+            sd.play(audio, self.device_sample_rate, device=self.output_device)
+            start_time = time.time()
+            
+            action_idx = 0
+            
+            # Monitor playback and execute actions
+            while sd.get_stream().active or action_idx < len(action_timings):
+                current_time = time.time() - start_time
+                
+                # Handle scheduled actions
+                while action_idx < len(action_timings):
+                    action_time, tool = action_timings[action_idx]
+                    
+                    if current_time >= action_time:
+                        self.console.print(f"\nExecuting {tool} at {current_time:.2f}s")
+                        self.tooling.run_tool(tool)
+                        action_idx += 1
+                        continue
+                    break
+                
+                time.sleep(0.01)
+            
+            # Ensure cleanup
+            self.tooling.reset_state()
+            self.console.print("\n[green]Playback complete![/green]")
+            
+            return self.device_sample_rate, audio
+            
         except Exception as e:
-            print(f"Error generating audio: {e}")
-            return np.zeros(self.sample_rate)
+            self.console.print(f"[red]Error in process_and_speak: {e}[/red]")
+            self.tooling.reset_state()
+            raise
 
     def cleanup(self):
         """Clean up resources"""
         try:
-            self._stop_event.set()
             self.tooling.cleanup()
         except Exception as e:
-            print(f"Error during service cleanup: {e}")
+            self.console.print(f"[red]Error during cleanup: {e}[/red]")
+
 if __name__ == "__main__":
     try:
         tts = TTSService()
@@ -203,7 +197,9 @@ if __name__ == "__main__":
         tts.process_and_speak(test_text)
 
     except Exception as e:
-        print(f"Error: {e}")
+        console = Console()
+        console.print(f"[red]Error: {e}[/red]")
+        raise
     finally:
         if 'tts' in locals():
             tts.cleanup()

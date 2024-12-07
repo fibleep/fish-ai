@@ -3,31 +3,40 @@ name = "fish-ai"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9,<3.10"
 dependencies = [
     "datasets>=3.1.0",
-    "fairseq>=0.12.2",
     "gtts>=2.5.4",
-    "ipykernel>=6.29.5",
+    "ipykernel<6.29.5", # newer versions might require Python 3.10+
     "langchain-anthropic>=0.3.0",
     "langchain-google-genai>=2.0.4",
     "langchain-groq>=0.2.1",
     "langchain-ollama>=0.2.0",
     "langchain-together>=0.2.0",
     "langgraph>=0.2.50",
+    "librosa>=0.10.2.post1",
     "load-dotenv>=0.1.0",
     "nltk>=3.9.1",
-    "numpy==2.0",
+    "numpy<2.0", # numpy 2.0 requires Python 3.10+
     "openai-whisper>=20240930",
+    "platformio>=6.1.16",
     "pygame>=2.6.1",
     "pyserial>=3.5",
     "pyttsx3>=2.98",
     "rich>=13.9.4",
-    "scipy>=1.14.1",
+    "scipy<1.14.1", # newer versions might require Python 3.10+
     "sentencepiece>=0.2.0",
     "simpleaudio>=1.0.4",
     "sounddevice>=0.5.1",
     "soundfile>=0.12.1",
-    "torch>=2.5.1",
-    "transformers>=4.46.2",
+    "torch<2.5.1", # use an older torch version for Python 3.9
+    "transformers==4.31.0",
+    "faster-whisper==1.0.0",
+    "tokenizers>=0.13,<0.16",
+    "whisperx",
+    "elevenlabs>=1.13.3",
+    "pydub>=0.25.1",
+    "pyaudio>=0.2.14",
 ]
+[tool.uv.sources]
+whisperx = { git = "https://github.com/m-bain/whisperx.git" }
