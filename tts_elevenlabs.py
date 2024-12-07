@@ -36,7 +36,7 @@ class ElevenLabsTTSService:
             raise
         
         self.client = ElevenLabs(
-            api_key="sk_9fc2b48d11d6e4af926264d2b604f57fdf7e00a5cad16f61"
+            api_key=os.getenv("ELEVENLABS_API_KEY")
         )
         
         self.console.print("[green]Initialization complete![/green]")
