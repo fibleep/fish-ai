@@ -13,3 +13,6 @@ venv
 synthetic_data/.env
 ./torch_hub
 ./.model_cache*.csv
+.model_cache
+recordings
+tts_cache
