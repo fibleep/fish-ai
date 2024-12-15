@@ -5,309 +5,252 @@ import json
 from typing import Optional, Dict, List, Tuple, Set
 from dataclasses import dataclass
 import re
-from queue import PriorityQueue
 import threading
 from enum import Enum, auto
 
-class MotorState(Enum):
-    IDLE = auto()
-    BUSY = auto()
-    PENDING = auto()
-
-@dataclass(order=True)
-class ToolCommand:
-    priority: int
-    timestamp: float
-    motor: int
-    speed: int
-    duration: Optional[float]
-    is_action: bool
-    tool_name: str = ''
-    block_other_motors: bool = False
+@dataclass
+class MotorControl:
+    speed: int = 0
+    end_time: float = 0
+    is_moving: bool = False
+    last_command_time: float = 0
+    queued_stop: bool = False
 
 class Tooling:
     def __init__(self):
-        """Initialize the Tooling class with Arduino connection"""
         self.serial_conn = None
         self.port = None
         
-        # Motor states
-        self.motor_states = {1: MotorState.IDLE, 2: MotorState.IDLE, 3: MotorState.IDLE}
-        self.motor_locks = {
-            1: threading.Lock(),  # Mouth motor
-            2: threading.Lock(),  # Head motor
-            3: threading.Lock()   # Tail motor
+        # Enhanced motor tracking
+        self.motors = {
+            1: MotorControl(),  # Mouth
+            2: MotorControl(),  # Head
+            3: MotorControl()   # Tail
         }
         
-        # Separate queues for each motor
-        self.command_queues = {
-            1: PriorityQueue(),  # Mouth motor
-            2: PriorityQueue(),  # Head motor
-            3: PriorityQueue()   # Tail motor
+        # Minimal cooldowns for hardware protection
+        self.cooldowns = {
+            "TailFlop": 0.1,
+            "HeadFlop": 0.1,
+            "MoveHead&&Outward": 0.05,
+            "MoveHead&&Inward": 0.05
         }
+        self.last_actions = {action: 0 for action in self.cooldowns}
         
-        # Mouth specific state
-        self.mouth_state = "closed"
-        self.mouth_last_change = 0
-        self.MIN_MOUTH_INTERVAL = 0.1  # Minimum time between mouth movements
+        # Mouth state tracking
+        self.mouth_open = False
+        self.last_mouth_move = 0
+        self.MOUTH_INTERVAL = 0.02
         
-        # Action cooldowns
-        self.action_cooldowns = {
-            "TailFlop": 0.5,
-            "HeadFlop": 0.5,
-            "MoveHead&&Outward": 0.3,
-            "MoveHead&&Inward": 0.3
-        }
-        self.last_action_times = {action: 0 for action in self.action_cooldowns}
-        
-        # Initialize connection
         try:
             self._init_connection()
         except Exception as e:
             print(f"Failed to initialize connection: {e}")
             raise
 
-        # Start command processing threads - one for each motor
+        # Start update thread
         self.running = True
-        self.command_threads = {
-            motor: threading.Thread(target=self._process_motor_queue, args=(motor,), daemon=True)
-            for motor in range(1, 4)
-        }
-        for thread in self.command_threads.values():
-            thread.start()
+        self.update_thread = threading.Thread(target=self._update_loop, daemon=True)
+        self.update_thread.start()
 
     def _find_arduino_port(self) -> Optional[str]:
-        """Find the Arduino port using platformio"""
         try:
             result = subprocess.run(['pio', 'device', 'list', '--json-output'], 
                                   capture_output=True, text=True, check=True)
-            devices: List[Dict] = json.loads(result.stdout)
-            
-            if not devices:
-                print("No devices found")
-                return None
-            
-            selected_device = devices[-1]
-            return selected_device.get('port')
-            
+            return json.loads(result.stdout)[-1].get('port')
         except Exception as e:
             print(f"Error finding Arduino port: {e}")
             return None
 
     def _init_connection(self):
-        """Initialize the serial connection to Arduino"""
         self.port = self._find_arduino_port()
         if not self.port:
             raise Exception("Failed to find Arduino port")
         
         try:
             self.serial_conn = serial.Serial(self.port, 115200, timeout=1)
-            time.sleep(2)  # Wait for Arduino initialization
-            print(f"Successfully connected to Arduino on port {self.port}")
-        except serial.SerialException as e:
-            raise Exception(f"Failed to connect to Arduino: {e}")
-
-    def _can_execute_action(self, tool_name: str) -> bool:
-        """Check if an action can be executed based on cooldowns"""
-        if tool_name not in self.action_cooldowns:
-            return True
+            time.sleep(2)  # Initial connection only
+            print(f"Connected to Arduino on {self.port}")
             
-        current_time = time.time()
-        cooldown = self.action_cooldowns[tool_name]
-        last_time = self.last_action_times[tool_name]
-        
-        return current_time - last_time >= cooldown
-
-    def _process_motor_queue(self, motor: int):
-        """Process commands for a specific motor"""
-        while self.running:
-            try:
-                if self.command_queues[motor].empty():
-                    time.sleep(0.01)
-                    continue
+            # Reset all motors on connection
+            for motor in range(1, 4):
+                self._send_immediate_command(motor, 0)
+                time.sleep(0.1)  # Small delay between resets
                 
-                command = self.command_queues[motor].get()
-                
-                # Skip if cooldown hasn't elapsed for actions
-                if command.is_action and not self._can_execute_action(command.tool_name):
-                    self.command_queues[motor].put(command)  # Put it back in queue
-                    time.sleep(0.01)
-                    continue
-                
-                with self.motor_locks[motor]:
-                    self.motor_states[motor] = MotorState.BUSY
-                    
-                    # Send command to Arduino
-                    cmd_str = f"{motor},{command.speed}"
-                    if command.duration is not None:
-                        cmd_str += f",{int(command.duration * 1000)}"
-                    cmd_str += "\n"
-                    
-                    if self.serial_conn:
-                        print(f"Sending command: {cmd_str.strip()}")
-                        self.serial_conn.write(cmd_str.encode())
-                        
-                        if command.duration:
-                            time.sleep(command.duration)
-                            # Reset motor to stopped state after duration
-                            if command.is_action:
-                                stop_cmd = f"{motor},0\n"
-                                self.serial_conn.write(stop_cmd.encode())
-                            
-                        if command.is_action:
-                            self.last_action_times[command.tool_name] = time.time()
-                    
-                    self.motor_states[motor] = MotorState.IDLE
-                    
-            except Exception as e:
-                print(f"Error processing command for motor {motor}: {e}")
-                self.motor_states[motor] = MotorState.IDLE
-
-    def can_move_mouth(self) -> bool:
-        """Check if it's safe to move the mouth"""
-        current_time = time.time()
-        if current_time - self.mouth_last_change < self.MIN_MOUTH_INTERVAL:
-            return False
-        if self.motor_states[1] != MotorState.IDLE:
-            return False
-        return True
-
-    def queue_command(self, motor: int, speed: int, duration: Optional[float] = None, 
-                     is_action: bool = False, priority: int = 2, tool_name: str = '',
-                     block_other_motors: bool = False) -> bool:
-        """Queue a command for a specific motor"""
-        try:
-            command = ToolCommand(
-                priority=priority,
-                timestamp=time.time(),
-                motor=motor,
-                speed=speed,
-                duration=duration,
-                is_action=is_action,
-                tool_name=tool_name,
-                block_other_motors=block_other_motors
-            )
-            self.command_queues[motor].put(command)
-            return True
         except Exception as e:
-            print(f"Error queuing command: {e}")
+            raise Exception(f"Failed to connect: {e}")
+
+    def _update_loop(self):
+        """Main update loop for motor control"""
+        while self.running:
+            current_time = time.time()
+            
+            # Process motor stops
+            for motor_id, motor in self.motors.items():
+                if motor.is_moving and motor.end_time > 0 and current_time >= motor.end_time and not motor.queued_stop:
+                    print(f"Stopping motor {motor_id} after duration")
+                    self._send_immediate_command(motor_id, 0)
+                    motor.is_moving = False
+                    motor.end_time = 0
+                    motor.queued_stop = True
+            
+            time.sleep(0.01)
+
+    def _send_immediate_command(self, motor: int, speed: int, duration: Optional[float] = None):
+        """Send command directly to Arduino with improved timing"""
+        if not self.serial_conn or not self.serial_conn.is_open:
+            print("Serial connection lost")
+            return
+            
+        cmd = f"{motor},{speed}"
+        if duration:
+            cmd += f",{int(duration * 1000)}"
+        cmd += "\n"
+        
+        try:
+            print(f"Sending command: {cmd.strip()}")
+            self.serial_conn.write(cmd.encode())
+            self.serial_conn.flush()
+            
+            # Update motor state
+            motor_ctrl = self.motors[motor]
+            motor_ctrl.speed = speed
+            motor_ctrl.is_moving = speed != 0
+            if duration:
+                motor_ctrl.end_time = time.time() + (duration * 1.1)  # Add 10% to duration for safety
+            else:
+                motor_ctrl.end_time = 0
+            motor_ctrl.last_command_time = time.time()
+            motor_ctrl.queued_stop = False
+            
+            # Small delay to ensure command is processed
+            time.sleep(0.01)
+            
+        except Exception as e:
+            print(f"Failed to send command: {e}")
+
+    def move_mouth(self, open_mouth: bool) -> bool:
+        """Control mouth movement"""
+        current_time = time.time()
+        if current_time - self.last_mouth_move < self.MOUTH_INTERVAL:
+            return False
+            
+        if open_mouth != self.mouth_open:
+            self._send_immediate_command(1, 255 if open_mouth else 0)
+            self.mouth_open = open_mouth
+            self.last_mouth_move = current_time
+            return True
+        return False
+
+    def run_tool(self, tool: str) -> bool:
+        """Execute tool command with improved timing"""
+        current_time = time.time()
+        
+        try:
+            if tool.startswith("Mouth"):
+                return self.move_mouth(tool == "MouthOpen")
+            
+            if tool in self.cooldowns:
+                if current_time - self.last_actions[tool] < self.cooldowns[tool]:
+                    return False
+                self.last_actions[tool] = current_time
+            
+            if tool == "TailFlop":
+                print(f"Executing TailFlop at {time.time()}")
+                # Ensure tail movement completes
+                self._send_immediate_command(3, 255, 0.3)  # Longer duration for visibility
+                return True
+                
+            elif tool == "HeadFlop":
+                self._send_immediate_command(2, 255, 0.2)
+                return True
+                
+            elif tool == "MoveHead&&Outward":
+                self._send_immediate_command(2, 255)
+                return True
+                
+            elif tool == "MoveHead&&Inward":
+                self._send_immediate_command(2, 0)
+                return True
+                
+            print(f"Unknown tool: {tool}")
+            return False
+            
+        except Exception as e:
+            print(f"Tool error: {e}")
             return False
 
     def extract_tools(self, text: str) -> Tuple[str, Dict[str, int]]:
-        """Extract all tools within << >> from the text"""
-        tool_positions = {}
-        cleaned_text = text
+        """Extract tools from text"""
+        tools = {}
+        clean_text = text
         
         for tool in re.findall(r"<<(.*?)>>", text):
-            tool_positions[tool] = text.find(f"<<{tool}>>")
-            cleaned_text = cleaned_text.replace(f"<<{tool}>>", "")
+            tools[tool] = text.find(f"<<{tool}>>")
+            clean_text = clean_text.replace(f"<<{tool}>>", "")
 
-        print(f"Extracted tools: {tool_positions}")
-        print(f"Cleaned text: {cleaned_text}")
-            
-        return cleaned_text, tool_positions
-
-    def run_tool(self, tool: str) -> bool:
-        """Run the specified tool with priority handling"""
-        try:
-            print(f"Executing tool: {tool}")
-            
-            if tool == "MouthOpen":
-                if self.can_move_mouth() and self.mouth_state == "closed":
-                    self.queue_command(1, 255, is_action=False, priority=1, tool_name=tool)
-                    self.mouth_state = "open"
-                    self.mouth_last_change = time.time()
-                    return True
-                
-            elif tool == "MouthClose":
-                if self.can_move_mouth() and self.mouth_state == "open":
-                    self.queue_command(1, 0, is_action=False, priority=1, tool_name=tool)
-                    self.mouth_state = "closed"
-                    self.mouth_last_change = time.time()
-                    return True
-                
-            elif tool == "TailFlop":
-                # Tail flop is completely independent
-                return self.queue_command(3, 255, duration=0.2, is_action=True, 
-                                       priority=2, tool_name=tool)
-                
-            elif tool == "MoveHead&&Outward":
-                return self.queue_command(2, 255, is_action=True, 
-                                       priority=2, tool_name=tool)
-                
-            elif tool == "MoveHead&&Inward":
-                return self.queue_command(2, 0, is_action=True, 
-                                       priority=2, tool_name=tool)
-                
-            elif tool == "HeadFlop":
-                return self.queue_command(2, 255, duration=0.2, is_action=True, 
-                                       priority=2, tool_name=tool)
-            
-            return False
-            
-        except Exception as e:
-            print(f"Error running tool {tool}: {e}")
-            return False
+        print(f"Extracted tools: {tools}")
+        return clean_text, tools
 
     def reset_state(self) -> bool:
         """Reset all motors to initial state"""
         try:
-            print("Resetting all motors to initial state...")
-            # Queue reset commands with highest priority
+            # Wait for any pending actions to complete
+            time.sleep(0.1)
+            
             for motor in range(1, 4):
-                self.queue_command(motor, 0, is_action=False, priority=1)
-            self.mouth_state = "closed"
+                self._send_immediate_command(motor, 0)
+            self.mouth_open = False
             return True
         except Exception as e:
-            print(f"Error resetting state: {e}")
+            print(f"Reset failed: {e}")
             return False
 
     def cleanup(self):
-        """Cleanup resources"""
-        try:
-            self.running = False
-            for thread in self.command_threads.values():
-                thread.join(timeout=1)
+        """Clean shutdown"""
+        print("Starting cleanup...")
+        self.running = False
+        
+        if hasattr(self, 'update_thread'):
+            # Wait for all motors to complete their actions
+            for motor in self.motors.values():
+                if motor.is_moving and motor.end_time > 0:
+                    remaining_time = motor.end_time - time.time()
+                    if remaining_time > 0:
+                        time.sleep(remaining_time)
             
-            if self.serial_conn:
-                # Stop all motors
-                for motor in range(1, 4):
-                    cmd = f"{motor},0\n"
-                    self.serial_conn.write(cmd.encode())
-                time.sleep(0.1)
-                self.serial_conn.close()
-        except Exception as e:
-            print(f"Error during cleanup: {e}")
+            self.update_thread.join(timeout=1)
+        
+        if self.serial_conn and self.serial_conn.is_open:
+            self.reset_state()
+            time.sleep(0.2)  # Give reset commands time to execute
+            self.serial_conn.close()
+            
+        print("Cleanup complete")
 
     def __del__(self):
-        """Cleanup when object is destroyed"""
         self.cleanup()
 
 if __name__ == "__main__":
-    print("Initializing Tooling test sequence...")
-    
     try:
-        tools = Tooling()
+        tooling = Tooling()
+        print("\nTesting basic commands...")
         
-        # Test sequence with proper delays
-        sequence = [
-            ("MouthOpen", 0.2),
-            ("TailFlop", 0.2),
-            ("HeadFlop", 0.2),
-            ("MouthClose", 0.2),
-            ("MoveHead&&Outward", 0.2),
-            ("MoveHead&&Inward", 0.2)
+        # Test sequence
+        test_sequence = [
+            ("TailFlop", 0.5),    # Increased delay for tail movement
+            ("HeadFlop", 0.3),
+            ("MoveHead&&Outward", 0.3),
+            ("MoveHead&&Inward", 0.3)
         ]
         
-        for action, delay in sequence:
+        for action, delay in test_sequence:
             print(f"\nExecuting {action}...")
-            tools.run_tool(action)
+            tooling.run_tool(action)
             time.sleep(delay)
-            
+        
     except Exception as e:
-        print(f"Test sequence failed: {e}")
+        print(f"Test error: {e}")
     finally:
-        if 'tools' in locals():
-            print("\nCleaning up...")
-            tools.cleanup()
-            print("Test sequence completed.")
+        if 'tooling' in locals():
+            tooling.cleanup()

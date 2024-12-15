@@ -16,3 +16,4 @@ synthetic_data/.env
 .model_cache
 recordings
 tts_cache
+.env

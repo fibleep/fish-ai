@@ -53,8 +53,8 @@ class AudioProcessor:
         self.is_running = False
         
         # Initialize services
-        # self.tts = ElevenLabsTTSService()
-        self.tts = ESpeakTTSService()
+        self.tts = ElevenLabsTTSService()
+        # self.tts = ESpeakTTSService()
         self.graph = create_graph()
         
         # Silence detection settings

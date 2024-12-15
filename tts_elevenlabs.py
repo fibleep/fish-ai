@@ -14,13 +14,16 @@ import hashlib
 import json
 import pathlib
 from typing import Optional
+from collections import deque
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class ElevenLabsTTSService:
     def __init__(self, cache_dir="tts_cache"):
         self.console = Console()
         self.console.print("[cyan]Initializing ElevenLabs TTS Service...[/cyan]")
         
-        # Initialize cache directory
         self.cache_dir = pathlib.Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.console.print(f"[cyan]Using cache directory: {self.cache_dir}[/cyan]")
@@ -39,32 +42,12 @@ class ElevenLabsTTSService:
             api_key=os.getenv("ELEVENLABS_API_KEY")
         )
         
+        # Audio analysis parameters
+        self.chunk_size = int(self.device_sample_rate * 0.02)  # 20ms chunks
+        self.energy_threshold = 0.1  # Adjustable threshold for mouth movement
+        self.min_mouth_duration = 0.02  # Minimum time for mouth to stay in one position
+        
         self.console.print("[green]Initialization complete![/green]")
-
-    def _generate_cache_key(self, text: str, voice_id: str, model_id: str, voice_settings: dict) -> str:
-        """Generate a unique cache key based on input parameters"""
-        params = {
-            'text': text,
-            'voice_id': voice_id,
-            'model_id': model_id,
-            'voice_settings': voice_settings
-        }
-        param_str = json.dumps(params, sort_keys=True)
-        return hashlib.md5(param_str.encode()).hexdigest()
-
-    def _get_cached_audio(self, cache_key: str) -> Optional[bytes]:
-        """Try to get audio data from cache"""
-        cache_file = self.cache_dir / f"{cache_key}.mp3"
-        if cache_file.exists():
-            self.console.print("[green]Found cached audio![/green]")
-            return cache_file.read_bytes()
-        return None
-
-    def _save_to_cache(self, cache_key: str, audio_data: bytes):
-        """Save audio data to cache"""
-        cache_file = self.cache_dir / f"{cache_key}.mp3"
-        cache_file.write_bytes(audio_data)
-        self.console.print("[green]Saved audio to cache[/green]")
 
     def find_and_set_devices(self):
         devices = sd.query_devices()
@@ -103,7 +86,54 @@ class ElevenLabsTTSService:
         self.console.print(f"[green]Using output device: {device_info['name']}[/green]")
         self.console.print(f"[green]Sample rate: {self.device_sample_rate} Hz[/green]")
 
+    def _generate_cache_key(self, text: str, voice_id: str, model_id: str, voice_settings: dict) -> str:
+        """Generate a unique cache key based on input parameters"""
+        params = {
+            'text': text,
+            'voice_id': voice_id,
+            'model_id': model_id,
+            'voice_settings': voice_settings
+        }
+        param_str = json.dumps(params, sort_keys=True)
+        return hashlib.md5(param_str.encode()).hexdigest()
+
+    def _get_cached_audio(self, cache_key: str) -> Optional[bytes]:
+        """Try to get audio data from cache"""
+        cache_file = self.cache_dir / f"{cache_key}.mp3"
+        if cache_file.exists():
+            self.console.print("[green]Found cached audio![/green]")
+            return cache_file.read_bytes()
+        return None
+
+    def _save_to_cache(self, cache_key: str, audio_data: bytes):
+        """Save audio data to cache"""
+        cache_file = self.cache_dir / f"{cache_key}.mp3"
+        cache_file.write_bytes(audio_data)
+        self.console.print("[green]Saved audio to cache[/green]")
+
+    def analyze_audio_energy(self, audio: np.ndarray) -> list:
+        """Analyze audio energy to determine mouth movements"""
+        chunks = np.array_split(audio, len(audio) // self.chunk_size)
+        mouth_states = []
+        
+        # Use rolling average for smoother transitions
+        window_size = 3
+        rolling_energy = []
+        
+        for chunk in chunks:
+            energy = np.sqrt(np.mean(chunk**2))
+            rolling_energy.append(energy)
+            
+            if len(rolling_energy) > window_size:
+                rolling_energy.pop(0)
+            
+            avg_energy = np.mean(rolling_energy)
+            mouth_states.append(avg_energy > self.energy_threshold)
+        
+        return mouth_states
+
     def process_audio(self, audio_data):
+        """Process audio data for playback and analysis"""
         audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_data))
         samples = np.array(audio_segment.get_array_of_samples())
         audio = samples.astype(np.float32)
@@ -111,11 +141,9 @@ class ElevenLabsTTSService:
         # Normalize audio
         audio = audio / (np.abs(audio).max() + 1e-6) * 0.9
         
-        # Convert to mono if stereo
         if len(audio.shape) > 1:
             audio = np.mean(audio, axis=1)
         
-        # Resample to match device sample rate
         if audio_segment.frame_rate != self.device_sample_rate:
             self.console.print(f"[cyan]Resampling from {audio_segment.frame_rate} Hz to {self.device_sample_rate} Hz...[/cyan]")
             audio = librosa.resample(
@@ -126,20 +154,34 @@ class ElevenLabsTTSService:
         
         return audio.astype(np.float32)
 
+    def _generate_audio(self, text: str, voice_settings: dict) -> bytes:
+        """Generate audio from ElevenLabs"""
+        self.console.print("\n[cyan]Generating speech with ElevenLabs...[/cyan]")
+        audio_data = b''
+        response = self.client.text_to_speech.convert(
+            voice_id="pNInz6obpgDQGcFmaJgB",
+            output_format="mp3_22050_32",
+            text=text,
+            model_id="eleven_turbo_v2_5",
+            voice_settings=VoiceSettings(**voice_settings)
+        )
+        
+        for chunk in response:
+            audio_data += chunk
+        
+        self._save_to_cache(self._generate_cache_key(
+            text, "pNInz6obpgDQGcFmaJgB", "eleven_turbo_v2_5", voice_settings
+        ), audio_data)
+        
+        return audio_data
+
     def process_and_speak(self, text: str):
+        """Main method to process text and generate speech with actions"""
         try:
             # Extract tools and clean text
             cleaned_text, tool_positions = self.tooling.extract_tools(text)
             
-            # Create list of actions with their timing positions
-            actions = [(pos, tool) for tool, pos in tool_positions.items()]
-            actions.sort()
-            
-            self.console.print(f"\nFound {len(actions)} actions in text")
-            for pos, tool in actions:
-                self.console.print(f"Position {pos}: {tool}")
-            
-            # Generate or retrieve cached audio
+            # Voice settings
             voice_settings_dict = {
                 'stability': 0.0,
                 'similarity_boost': 1.0,
@@ -147,6 +189,7 @@ class ElevenLabsTTSService:
                 'use_speaker_boost': True
             }
             
+            # Get or generate audio
             cache_key = self._generate_cache_key(
                 cleaned_text,
                 "pNInz6obpgDQGcFmaJgB",
@@ -154,87 +197,81 @@ class ElevenLabsTTSService:
                 voice_settings_dict
             )
             
-            audio_data = self._get_cached_audio(cache_key)
+            audio_data = self._get_cached_audio(cache_key) or self._generate_audio(
+                cleaned_text, voice_settings_dict)
             
-            if audio_data is None:
-                self.console.print("\n[cyan]Generating speech with ElevenLabs...[/cyan]")
-                audio_data = b''
-                response = self.client.text_to_speech.convert(
-                    voice_id="pNInz6obpgDQGcFmaJgB",
-                    output_format="mp3_22050_32",
-                    text=cleaned_text,
-                    model_id="eleven_turbo_v2_5",
-                    voice_settings=VoiceSettings(
-                        stability=0.0,
-                        similarity_boost=1.0,
-                        style=0.0,
-                        use_speaker_boost=True,
-                    )
-                )
-                
-                for chunk in response:
-                    audio_data += chunk
-                
-                # Save to cache
-                self._save_to_cache(cache_key, audio_data)
-            
-            # Process audio data
+            # Process audio and analyze for mouth movements
             audio = self.process_audio(audio_data)
+            mouth_states = self.analyze_audio_energy(audio)
             
-            # Calculate timing information
+            # Calculate timings based on text position
             total_duration = len(audio) / self.device_sample_rate
             char_to_time_ratio = total_duration / len(cleaned_text)
             
-            # Calculate action timings
-            action_timings = []
-            for pos, tool in actions:
-                action_time = min(pos * char_to_time_ratio, total_duration - 0.1)
-                action_timings.append((action_time, tool))
-                self.console.print(f"Scheduled {tool} at {action_time:.2f} seconds")
+            # Queue actions (excluding mouth movements) with relative timings
+            actions = deque([
+                (pos * char_to_time_ratio, tool)
+                for tool, pos in tool_positions.items()
+                if not tool.startswith("Mouth")
+            ])
             
-            self.console.print(f"\n[cyan]Audio info:[/cyan]")
-            self.console.print(f"Duration: {total_duration:.2f} seconds")
-            self.console.print(f"Sample rate: {self.device_sample_rate} Hz")
-            self.console.print(f"Shape: {audio.shape}")
+            # Sort actions by timing
+            actions = deque(sorted(actions, key=lambda x: x[0]))
             
-            # Start playback
             self.console.print("\n[green]Starting playback...[/green]")
             
-            # Start playing audio in a non-blocking way
-            start_time = time.time()
+            # Start playback and get the exact start time
+            playback_start = time.time()
             sd.play(audio, self.device_sample_rate)
             
-            # Monitor and execute actions while audio is playing
-            action_idx = 0
-            while sd.get_stream().active or action_idx < len(action_timings):
-                current_time = time.time() - start_time
+            # Playback loop
+            chunk_duration = self.chunk_size / self.device_sample_rate
+            last_mouth_state = False
+            chunk_index = 0
+            last_mouth_change = time.time()
+            
+            while sd.get_stream().active or actions:
+                current_time = time.time() - playback_start  # Relative time from start
                 
-                # Execute any actions that should happen now
-                while action_idx < len(action_timings):
-                    action_time, tool = action_timings[action_idx]
-                    if current_time >= action_time:
-                        self.console.print(f"\nExecuting {tool} at {current_time:.2f}s")
+                # Handle mouth movement
+                if chunk_index < len(mouth_states):
+                    should_open = mouth_states[chunk_index]
+                    if should_open != last_mouth_state and (time.time() - last_mouth_change) >= self.min_mouth_duration:
+                        if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
+                            self.tooling.move_mouth(should_open)
+                            last_mouth_state = should_open
+                            last_mouth_change = time.time()
+                    chunk_index = int(current_time / chunk_duration)
+                
+                # Execute queued actions
+                while actions and current_time >= actions[0][0]:
+                    action_time, tool = actions.popleft()
+                    self.console.print(f"\nExecuting {tool} at {current_time:.2f}s")
+                    if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
                         self.tooling.run_tool(tool)
-                        action_idx += 1
                     else:
-                        break
-                        
-                time.sleep(0.01)  # Small sleep to prevent CPU hogging
+                        self.console.print("[red]Serial connection lost, attempting to reconnect...[/red]")
+                        self.tooling._init_connection()
+                
+                time.sleep(0.005)
             
-            sd.wait()  # Wait for playback to finish
-            
-            # Cleanup
-            self.tooling.reset_state()
+            sd.wait()
+            if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
+                self.tooling.reset_state()
             self.console.print("\n[green]Playback complete![/green]")
             
         except Exception as e:
             self.console.print(f"[red]Error in process_and_speak: {e}[/red]")
-            self.tooling.reset_state()
+            if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
+                self.tooling.reset_state()
             raise
 
     def cleanup(self):
+        """Clean up resources"""
         try:
-            self.tooling.cleanup()
+            # Only cleanup if we haven't already
+            if hasattr(self, 'tooling') and self.tooling.serial_conn and self.tooling.serial_conn.is_open:
+                self.tooling.cleanup()
         except Exception as e:
             self.console.print(f"[red]Error during cleanup: {e}[/red]")
 
@@ -252,7 +289,7 @@ if __name__ == "__main__":
         tts = ElevenLabsTTSService()
         
         test_text = """
-        Hello! <<MouthOpen>>This is a test of our integrated system.<<MouthClose>> 
+        Hello! This is a test of our integrated system.
         Watch as I <<MoveHead&&Outward>>move my head outward<<MoveHead&&Inward>>. 
         Now, <<TailFlop>>watch my tail flop!
         """
