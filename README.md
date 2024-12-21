@@ -18,3 +18,6 @@ uv sync
    - TODO: Currently won't work because ElevenLabs implementation is missing
 - `input.py` - 'uv run input.py' to run the local pipeline
 - `agent_assets/` - contains the code for the "agent", but it's not really an agent - super simple implementation without any tools
+- `fish-driver/` - contains the code for the Arduino, PIO project
+
+The arduino <-> python communication is done via serial.
