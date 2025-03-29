@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env
+tts_cache/
+recording.wav
+.gitignore
+command.wav

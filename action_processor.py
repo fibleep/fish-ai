@@ -26,7 +26,6 @@ class ActionProcessor:
         
         self.cache_dir = pathlib.Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
-        self.console.print(f"[cyan]Using cache directory: {self.cache_dir}[/cyan]")
         
         warnings.filterwarnings('ignore', category=UserWarning)
         
@@ -43,7 +42,13 @@ class ActionProcessor:
         self.energy_threshold = 0.1
         self.min_mouth_duration = 0.02
         
+        # Track last tool executed for persistence
+        self.last_tool = None
+        self.conversation_active = True
+        
         self.console.print("[green]AudioProcessor initialization complete![/green]")
+        
+        self.current_ambient_playback = None
 
     def find_and_set_devices(self):
         devices = sd.query_devices()
@@ -57,8 +62,8 @@ class ActionProcessor:
                 device_type.append('OUTPUT')
             
             self.console.print(f"[cyan]{i}:[/cyan] {device['name']} "
-                             f"({', '.join(device_type)}) "
-                             f"- Default SR: {device['default_samplerate']}")
+                            f"({', '.join(device_type)}) "
+                            f"- Default SR: {device['default_samplerate']}")
 
         self.output_device = None
         for i, device in enumerate(devices):
@@ -70,6 +75,9 @@ class ActionProcessor:
         if self.output_device is None:
             self.console.print("[yellow]UACDemo device not found, using default output[/yellow]")
             self.output_device = sd.default.device[1]
+        else:
+            os.environ['SDL_AUDIODRIVER'] = 'alsa'
+            os.environ['SDL_AUDIODEV'] = 'sysdefault:CARD=UACDemoV10'
             
         device_info = sd.query_devices(self.output_device)
         self.device_sample_rate = int(device_info['default_samplerate'])
@@ -141,7 +149,12 @@ class ActionProcessor:
                 target_sr=self.device_sample_rate
             )
         
-        return audio.astype(np.float32)
+        # Add half a second buffer of silence at the end
+        buffer_samples = int(self.device_sample_rate * 0.5)
+        silent_buffer = np.zeros(buffer_samples, dtype=np.float32)
+        audio_with_buffer = np.concatenate([audio, silent_buffer])
+        
+        return audio_with_buffer.astype(np.float32)
 
     def _generate_audio(self, text: str, voice_settings: dict) -> bytes:
         self.console.print("\n[cyan]Generating speech with ElevenLabs...[/cyan]")
@@ -164,16 +177,75 @@ class ActionProcessor:
         
         return audio_data
 
-    def process_and_speak(self, text: str):
-        cleaned_text, tool_positions = self.tooling.extract_tools(text)
+    def play_sound(self, sound_file):
+        try:
+            with open(sound_file, 'rb') as f:
+                audio_data = f.read()
+            
+            audio = self.process_audio(audio_data)
+            sd.play(audio, self.device_sample_rate)
+            sd.wait()
+            print(f"Played sound: {sound_file}")
+        except Exception as e:
+            print(f"Error playing sound: {e}")
+
+    def play_ambient_sound(self, sound_file):
+        try:
+            self.stop_ambient_sound()
+            
+            with open(sound_file, 'rb') as f:
+                audio_data = f.read()
+            
+            audio = self.process_audio(audio_data)
+            
+            def _callback(outdata, frames, time, status):
+                if len(audio) > 0:
+                    if len(audio) >= frames:
+                        outdata[:] = audio[:frames].reshape(-1, 1)
+                        audio = np.roll(audio, -frames)
+                    else:
+                        outdata[:len(audio)] = audio.reshape(-1, 1)
+                        outdata[len(audio):] = 0
+            
+            self.current_ambient_playback = sd.OutputStream(
+                samplerate=self.device_sample_rate,
+                device=self.output_device,
+                channels=1,
+                callback=_callback,
+                blocksize=self.chunk_size
+            )
+            self.current_ambient_playback.start()
+            print(f"Started ambient sound: {sound_file}")
+            
+        except Exception as e:
+            print(f"Error playing ambient sound: {e}")
+
+    def stop_ambient_sound(self):
+        if self.current_ambient_playback is not None:
+            self.current_ambient_playback.stop()
+            self.current_ambient_playback.close()
+            self.current_ambient_playback = None
+            print("Stopped ambient sound")
+
+    def reset_conversation(self):
+        """Reset conversation state"""
+        self.conversation_active = False
         
+        if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
+            self.tooling.move_mouth(False)
+            self.tooling.run_tool("MoveHead&&Inward")
+            self.last_tool = None
+        
+        self.conversation_active = True
+        
+    def preprocess(self, text: str):
+        cleaned_text, tool_positions = self.tooling.extract_tools(text)
         voice_settings_dict = {
             'stability': 0.0,
             'similarity_boost': 1.0,
             'style': 0.0,
             'use_speaker_boost': True
         }
-        
         cache_key = self._generate_cache_key(
             cleaned_text,
             "pNInz6obpgDQGcFmaJgB",
@@ -182,9 +254,14 @@ class ActionProcessor:
         )
         
         audio_data = self._get_cached_audio(cache_key) or self._generate_audio(
-            cleaned_text, voice_settings_dict)
+            cleaned_text, voice_settings_dict
+        )
         
         audio = self.process_audio(audio_data)
+        return cleaned_text, tool_positions, audio
+        
+
+    def process_and_speak(self, cleaned_text, tool_positions, audio):
         mouth_states = self.analyze_audio_energy(audio)
         
         total_duration = len(audio) / self.device_sample_rate
@@ -207,6 +284,8 @@ class ActionProcessor:
         last_mouth_state = False
         chunk_index = 0
         last_mouth_change = time.time()
+        last_action = None
+        last_action_time = None
         
         while sd.get_stream().active or actions:
             current_time = time.time() - playback_start
@@ -225,6 +304,9 @@ class ActionProcessor:
                 self.console.print(f"\nExecuting {tool} at {current_time:.2f}s")
                 if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
                     self.tooling.run_tool(tool)
+                    last_action = tool
+                    last_action_time = action_time
+                    self.last_tool = tool  # Store the last tool for persistence
                 else:
                     self.console.print("[red]Serial connection lost, attempting to reconnect...[/red]")
                     self.tooling._init_connection()
@@ -234,16 +316,29 @@ class ActionProcessor:
         sd.wait()
         
         if self.tooling.serial_conn and self.tooling.serial_conn.is_open:
-            self.tooling.reset_state()
+            self.tooling.move_mouth(False)
+            
+            # Check if the last action is near the end of the audio
+            # If it's in the last 20% of the audio, consider it an "end state" to persist
+            if last_action and last_action_time:
+                time_from_end = total_duration - last_action_time
+                if time_from_end < 0.2 * total_duration:
+                    self.console.print(f"[yellow]Maintaining end state: {last_action}[/yellow]")
+                else:
+                    self.console.print(f"[cyan]Last action not at end, resetting state[/cyan]")
+                    self.tooling.reset_state()
+                    self.last_tool = None
+            else:
+                self.tooling.reset_state()
+                self.last_tool = None
             
         self.console.print("\n[green]Playback complete![/green]")
         
         return audio
 
-    def speak_text(self, text: str):
-        return self.process_and_speak(text)
-
     def cleanup(self):
+        self.stop_ambient_sound()
+        self.conversation_active = False
         if hasattr(self, 'tooling') and self.tooling.serial_conn and self.tooling.serial_conn.is_open:
             self.tooling.cleanup()
 
@@ -252,15 +347,3 @@ class ActionProcessor:
             cache_file.unlink()
         self.console.print("[green]Cache cleared successfully![/green]")
 
-
-if __name__ == "__main__":
-    processor = ActionProcessor()
-    
-    test_text = """
-    Hello! This is a test of our integrated audio processor.
-    Watch as I <<MoveHead&&Outward>>move my head outward<<MoveHead&&Inward>>. 
-    Now, <<TailFlop>>watch my tail flop!
-    """
-    
-    processor.speak_text(test_text)
-    processor.cleanup()
