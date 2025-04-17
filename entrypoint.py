@@ -22,7 +22,7 @@ is_recording = False
 ap = ActionProcessor()
 ambient_process = None
 
-def detect_wake_word(audio_data, threshold=0.3):
+def detect_wake_word(audio_data, threshold=0.6):
     audio_int16 = np.frombuffer(audio_data, np.int16)
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
     energy = np.mean(np.abs(audio_float32))
