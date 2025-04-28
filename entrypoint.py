@@ -3,6 +3,7 @@ import numpy as np
 import time
 import wave
 import subprocess
+import os
 from threading import Thread
 from queue import Queue
 from brain import FishBrain
@@ -26,6 +27,9 @@ ambient_process = None
 p = None
 stream = None
 
+# Get speaker device from environment variable, fallback to default
+SPEAKER_DEVICE = os.getenv('SPEAKER_DEVICE', 'sysdefault:CARD=UACDemoV10')
+
 def detect_wake_word(audio_data, threshold=0.6):
     audio_int16 = np.frombuffer(audio_data, np.int16)
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
@@ -43,10 +47,10 @@ def init_sound():
 
 def play_sound(sound_file):
     try:
-        subprocess.run(["aplay", "-q", "-D", "sysdefault:CARD=UACDemoV10", sound_file], check=True)
-        print(f"Played sound: {sound_file}")
+        subprocess.run(["aplay", "-q", "-D", SPEAKER_DEVICE, sound_file], check=True)
+        print(f"Played sound: {sound_file} on {SPEAKER_DEVICE}")
     except Exception as e:
-        print(f"Error playing sound: {e}")
+        print(f"Error playing sound on {SPEAKER_DEVICE}: {e}")
         try:
             subprocess.run(["aplay", "-q", sound_file], check=True)
             print(f"Played sound on default device: {sound_file}")
@@ -57,15 +61,16 @@ def play_ambient_sound(sound_file):
     global ambient_process
     try:
         stop_ambient_sound()
-        print(f"Starting ambient sound: {sound_file}")
+        print(f"Starting ambient sound: {sound_file} on {SPEAKER_DEVICE}")
         ambient_process = subprocess.Popen(
-            ["aplay", "-q", "-D", "sysdefault:CARD=UACDemoV10", sound_file],
+            ["aplay", "-q", "-D", SPEAKER_DEVICE, sound_file],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
     except Exception as e:
-        print(f"Error playing ambient sound: {e}")
+        print(f"Error playing ambient sound on {SPEAKER_DEVICE}: {e}")
         try:
+            print(f"Attempting ambient sound on default device")
             ambient_process = subprocess.Popen(
                 ["aplay", "-q", sound_file],
                 stdout=subprocess.DEVNULL,
