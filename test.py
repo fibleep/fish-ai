@@ -171,22 +171,23 @@ class RobustAudioPlayer:
             # Start aplay process that reads from stdin
             aplay_cmd = ['aplay', '-r', str(RECEIVE_SAMPLE_RATE), '-f', 'S16_LE', '-c', '1', '-t', 'raw']
             
-            # Try with direct hardware access first
-            if os.path.exists('/proc/asound/cards'):
-                with open('/proc/asound/cards', 'r') as f:
-                    cards_content = f.read()
-                    
-                for line in cards_content.splitlines():
-                    if 'UACDemoV1.0' in line:
-                        # Found the UACDemo device
-                        for i, part in enumerate(line.split()):
-                            if part.isdigit():
-                                card_num = part
-                                aplay_cmd.extend(['-D', f'plughw:{card_num},0'])
-                                print(f"Using direct hardware device: plughw:{card_num},0")
-                                break
+            # Removed specific device check - use default ALSA device
+            # # Try with direct hardware access first
+            # if os.path.exists('/proc/asound/cards'):
+            #     with open('/proc/asound/cards', 'r') as f:
+            #         cards_content = f.read()
+            #         
+            #     for line in cards_content.splitlines():
+            #         if 'UACDemoV1.0' in line:
+            #             # Found the UACDemo device
+            #             for i, part in enumerate(line.split()):
+            #                 if part.isdigit():
+            #                     card_num = part
+            #                     aplay_cmd.extend(['-D', f'plughw:{card_num},0'])
+            #                     print(f"Using direct hardware device: plughw:{card_num},0")
+            #                     break
             
-            print(f"Starting direct playback with: {' '.join(aplay_cmd)}")
+            print(f"Starting direct playback with default ALSA device: {' '.join(aplay_cmd)}")
             process = subprocess.Popen(
                 aplay_cmd,
                 stdin=subprocess.PIPE,

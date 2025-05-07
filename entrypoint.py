@@ -28,7 +28,7 @@ p = None
 stream = None
 
 # Get speaker device from environment variable, fallback to default
-SPEAKER_DEVICE = os.getenv('SPEAKER_DEVICE', 'sysdefault:CARD=UACDemoV10')
+SPEAKER_DEVICE = os.getenv('SPEAKER_DEVICE', 'default')
 
 def detect_wake_word(audio_data, threshold=0.6):
     audio_int16 = np.frombuffer(audio_data, np.int16)
