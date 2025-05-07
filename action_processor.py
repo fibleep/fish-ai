@@ -65,20 +65,10 @@ class ActionProcessor:
                             f"({', '.join(device_type)}) "
                             f"- Default SR: {device['default_samplerate']}")
 
-        self.output_device = None
-        for i, device in enumerate(devices):
-            if "UACDemoV1.0" in device['name'] and device['max_output_channels'] > 0:
-                self.output_device = i
-                self.console.print(f"\n[green]Found UACDemo device at index {i}[/green]")
-                break
+        # Always use the default output device
+        self.output_device = sd.default.device[1]
+        self.console.print(f"\n[green]Using default output device index: {self.output_device}[/green]")
 
-        if self.output_device is None:
-            self.console.print("[yellow]UACDemo device not found, using default output[/yellow]")
-            self.output_device = sd.default.device[1]
-        else:
-            os.environ['SDL_AUDIODRIVER'] = 'alsa'
-            os.environ['SDL_AUDIODEV'] = 'sysdefault:CARD=UACDemoV10'
-            
         device_info = sd.query_devices(self.output_device)
         self.device_sample_rate = int(device_info['default_samplerate'])
         

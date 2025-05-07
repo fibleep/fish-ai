@@ -166,4 +166,4 @@ def call(
 
 
 def transcribe_audio(audio_file: Union[str, bytes]) -> str:
-    return call("Generate a transcript of the speech, include diarization info - speakers, emotions in xml tags", audio=audio_file)
+    return call("Generate a transcript of the speech, include diarization info - speakers, emotions in xml tags, if there is no speech, return an empty string", audio=audio_file)
