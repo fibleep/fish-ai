@@ -8,6 +8,7 @@ from threading import Thread
 from queue import Queue
 from brain import FishBrain
 from action_processor import ActionProcessor
+import asyncio
 
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 512
@@ -22,13 +23,32 @@ INITIAL_LISTEN_TIMEOUT = 7.0 # Seconds to wait for user to speak after initial b
 
 audio_queue = Queue()
 is_recording = False
-ap = ActionProcessor()
+ap = None  # Will be initialized in main()
+brain = None  # Will be initialized in main()
 ambient_process = None
 p = None
 stream = None
 
-# Get speaker device from environment variable, fallback to default
-SPEAKER_DEVICE = os.getenv('SPEAKER_DEVICE', 'default')
+# Get speaker device from environment variable, fallback to CONEXANT USB AUDIO (card 3)
+SPEAKER_DEVICE = os.getenv('SPEAKER_DEVICE', 'plughw:3,0')
+MIC_DEVICE_NAME = os.getenv('MIC_DEVICE_NAME', 'CONEXANT USB AUDIO')
+MIC_DEVICE_INDEX = None
+
+# Force TTS output to use device 3 (CONEXANT USB AUDIO)
+os.environ['OUTPUT_DEVICE_INDEX'] = '3'
+
+def get_mic_index(p_instance):
+    """Find audio device index by name."""
+    print("Available audio input devices:")
+    for i in range(p_instance.get_device_count()):
+        dev = p_instance.get_device_info_by_index(i)
+        if dev['maxInputChannels'] > 0:
+            print(f"  {i}: {dev['name']}")
+            if MIC_DEVICE_NAME in dev['name']:
+                print(f"Found matching device: {dev['name']} at index {i}")
+                return i
+    print(f"Warning: Could not find audio device '{MIC_DEVICE_NAME}'. Using default.")
+    return None
 
 def detect_wake_word(audio_data, threshold=0.6):
     audio_int16 = np.frombuffer(audio_data, np.int16)
@@ -39,10 +59,38 @@ def detect_wake_word(audio_data, threshold=0.6):
         return True
     return False
 
+def set_volume_max():
+    """Set audio output volume to maximum (100%)"""
+    try:
+        # Set volume for the specific device
+        print(f"🔊 Setting volume to 100% for device {SPEAKER_DEVICE}...")
+        subprocess.run(["amixer", "-D", SPEAKER_DEVICE, "sset", "PCM", "100%"], 
+                      check=False, capture_output=True)
+        
+        # Also try setting Master volume if it exists
+        subprocess.run(["amixer", "-D", SPEAKER_DEVICE, "sset", "Master", "100%"], 
+                      check=False, capture_output=True)
+        
+        # Try setting volume for the card number (extract from plughw:X,Y)
+        if "plughw:" in SPEAKER_DEVICE:
+            card_num = SPEAKER_DEVICE.split(":")[1].split(",")[0]
+            subprocess.run(["amixer", "-c", card_num, "sset", "PCM", "100%"], 
+                          check=False, capture_output=True)
+            subprocess.run(["amixer", "-c", card_num, "sset", "Master", "100%"], 
+                          check=False, capture_output=True)
+        
+        print("🔊 Volume set to maximum")
+    except Exception as e:
+        print(f"⚠️ Could not set volume: {e}")
+
 def init_sound():
     beep = "beep.wav"
     microwave_beep = "microwave_beep.wav"
     microwave_ambient = "microwave_ambient.wav"
+    
+    # Set volume to maximum
+    set_volume_max()
+    
     return beep, microwave_beep, microwave_ambient
 
 def play_sound(sound_file):
@@ -106,21 +154,24 @@ def save_audio(frames, filename="command.wav"):
     return filename
 
 def open_wakeword_stream():
-    global p, stream
+    global p, stream, MIC_DEVICE_INDEX
     if stream is not None and stream.is_active():
         print("Wake word stream already open and active.")
         return
     if p is None:
         p = pyaudio.PyAudio()
+        MIC_DEVICE_INDEX = get_mic_index(p)
+
     print("Opening wake word stream...")
     stream = p.open(
         format=FORMAT,
         channels=CHANNELS,
         rate=SAMPLE_RATE,
         input=True,
-        frames_per_buffer=CHUNK_SIZE
+        frames_per_buffer=CHUNK_SIZE,
+        input_device_index=MIC_DEVICE_INDEX
     )
-    print("Wake word stream opened.")
+    print(f"Wake word stream opened on device index: {MIC_DEVICE_INDEX}")
 
 def close_wakeword_stream():
     global p, stream
@@ -154,9 +205,21 @@ def wakeword_process(brain):
                  data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                  if detect_wake_word(data, threshold):
                      print("Wake word detected with energy detector")
+                     # Set is_recording immediately to prevent duplicate triggers
+                     is_recording = True
                      close_wakeword_stream() # Close before recording starts
-                     record_command(brain)
-                     # Stream will be reopened automatically at the start of the next loop iteration if needed
+                     # Use threading to handle the async call
+                     import threading
+                     def run_async_command():
+                         loop = asyncio.new_event_loop()
+                         asyncio.set_event_loop(loop)
+                         try:
+                             loop.run_until_complete(record_command(brain))
+                         finally:
+                             loop.close()
+                     
+                     thread = threading.Thread(target=run_async_command)
+                     thread.start()
                  else:
                     time.sleep(0.01) # Short sleep only if not detected/recording
             else:
@@ -184,25 +247,28 @@ def wakeword_process(brain):
 
 def listen_and_record(listen_timeout, silence_duration_end, min_record_sec=1.0):
     frames = []
-    rec_p = pyaudio.PyAudio()
+    global p, MIC_DEVICE_INDEX
     rec_stream = None
 
+    if p is None:
+        print("Error: PyAudio instance not initialized.")
+        return None
+
     try:
-        rec_stream = rec_p.open(
+        rec_stream = p.open(
             format=FORMAT,
             channels=CHANNELS,
             rate=SAMPLE_RATE,
             input=True,
-            frames_per_buffer=CHUNK_SIZE
+            frames_per_buffer=CHUNK_SIZE,
+            input_device_index=MIC_DEVICE_INDEX
         )
     except Exception as e:
         print(f"Failed to open recording stream: {e}")
-        rec_p.terminate()
-        return None # Indicate failure to open stream
+        return None
 
-    print(f"Listening... (timeout in {listen_timeout:.1f}s)")
+    print(f"Listening... (timeout in {listen_timeout:.1f}s) on device index: {MIC_DEVICE_INDEX}")
     initial_sound_detected = False
-    recording_started = False
     listen_start_time = time.time()
 
     # 1. Listen for initial sound within timeout
@@ -210,48 +276,46 @@ def listen_and_record(listen_timeout, silence_duration_end, min_record_sec=1.0):
         try:
             data = rec_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             frames.append(data) # Start buffering immediately
+            
             audio_int16 = np.frombuffer(data, np.int16)
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
             energy = np.mean(np.abs(audio_float32))
 
             if energy > SILENCE_THRESHOLD * 1.5:
-                initial_sound_detected = True
-                recording_started = True
                 print("Initial speech detected.")
-                break # Sound detected, move to recording phase
+                initial_sound_detected = True
+                break
             time.sleep(0.01)
         except IOError as e:
             print(f"Error reading during initial listen: {e}")
-            time.sleep(0.1) # Avoid busy-looping on persistent errors
-
+            time.sleep(0.1)
 
     if not initial_sound_detected:
         print("No sound detected within timeout.")
         rec_stream.stop_stream()
         rec_stream.close()
-        rec_p.terminate()
-        return None # Indicate timeout
+        return None
 
     # 2. Record until silence or max duration
     print("Recording...")
     start_time = time.time()
     silence_start = None
-    max_record_duration = MAX_RECORD_SECONDS # Use the global max for safety
 
     # Trim leading silence buffered before speech detection
     # Heuristic: keep last 0.5 seconds before detected sound
     keep_chunks = int(0.5 * SAMPLE_RATE / CHUNK_SIZE)
     frames = frames[-keep_chunks:]
 
-    while time.time() - start_time < max_record_duration:
+
+    while time.time() - start_time < MAX_RECORD_SECONDS:
         try:
             data = rec_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             frames.append(data)
+            
             audio_int16 = np.frombuffer(data, np.int16)
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
             energy = np.mean(np.abs(audio_float32))
 
-            # Silence detection logic (only after minimum recording time)
             if time.time() - start_time > min_record_sec:
                 if energy < SILENCE_THRESHOLD:
                     if silence_start is None:
@@ -260,85 +324,106 @@ def listen_and_record(listen_timeout, silence_duration_end, min_record_sec=1.0):
                         print(f"Silence detected for {silence_duration_end:.1f}s, stopping recording.")
                         break
                 else:
-                    silence_start = None # Reset silence timer
+                    silence_start = None
             time.sleep(0.01)
         except IOError as e:
              print(f"Error reading during recording: {e}")
              time.sleep(0.1)
 
-
     print("Recording stopped.")
     rec_stream.stop_stream()
     rec_stream.close()
-    rec_p.terminate()
 
     if not frames:
         return None
 
     return frames
 
-def record_command(brain):
-    global is_recording
-    is_recording = True # Signal wake word loop to stop listening
+async def record_command(brain):
+    global is_recording, ap
+    # is_recording is already set to True in wake word detection
+    turn_count = 0  # Initialize turn_count at the start
 
-    # Ensure wake word stream is closed before playing sound
-    print("Wake word detected, preparing to record...")
-    time.sleep(0.2) # Give wakeword_process time to close stream
+    try:
+        # Move tail to indicate listening
+        print("🐟 Moving tail to indicate listening...")
+        ap.tooling.run_tool("MoveTail")
 
-    # Move head outwards to indicate listening
-    print("Moving head outwards...")
-    ap.tooling.run_tool("MoveHead&&Outward")
+        print("🔔 Playing beep sound...")
+        play_sound(beep_sound)
 
-    play_sound(beep_sound)
-    # No sleep needed here, listen_and_record handles opening its own stream
-
-    # --- Initial Command Recording ---
-    print("Recording your initial command...")
-    # Use INITIAL_LISTEN_TIMEOUT for the first command listen timeout
-    current_frames = listen_and_record(
-        listen_timeout=INITIAL_LISTEN_TIMEOUT, # Increased leniency
-        silence_duration_end=SILENCE_DURATION,
-        min_record_sec=1.5 # Existing minimum for initial command
-    )
-
-    if current_frames is None:
-        print("Initial command recording failed or timed out.")
-        is_recording = False # Allow wake word process to restart
-        return # Exit if initial recording failed
-
-    # --- Conversation Loop ---
-    while current_frames is not None:
-        print("Processing command...")
-        play_ambient_sound(microwave_ambient_sound)
-        audio_file = save_audio(current_frames, filename="command.wav") # Overwrite previous
-        response = brain.process_audio_input(audio_file)
-        cleaned_text, tool_positions, audio = ap.preprocess(response)
-        stop_ambient_sound()
-        play_sound(microwave_beep_sound) # Beep before speaking response
-        time.sleep(0.2)
-        ap.process_and_speak(cleaned_text, tool_positions, audio)
-        print(f"Fish: {response}") # Print after speaking
-
-        # --- Listen for Follow-up ---
-        print("Listening for follow-up command...")
+        # --- Initial Command Recording ---
+        print("🎤 Starting initial command recording...")
         current_frames = listen_and_record(
-            listen_timeout=FOLLOW_UP_LISTEN_TIMEOUT,
-            silence_duration_end=FOLLOW_UP_SILENCE_DURATION,
-            min_record_sec=0.5 # Shorter min recording for follow-ups
+            listen_timeout=INITIAL_LISTEN_TIMEOUT,
+            silence_duration_end=SILENCE_DURATION,
+            min_record_sec=1.5
         )
 
         if current_frames is None:
-            print("No follow-up detected within timeout.")
-            # Loop condition (current_frames is None) will cause exit
+            print("❌ Initial command recording failed or timed out.")
+            return # Exit if initial recording failed
 
-    # --- End of Conversation ---
-    print("Conversation turn ended.")
-    is_recording = False # Allow wake word process to restart listening
+        # --- Conversation Loop ---
+        while current_frames is not None:
+            turn_count += 1
+            print(f"\n🔄 === CONVERSATION TURN {turn_count} ===")
+            print("🎵 Playing processing ambient sound...")
+            play_ambient_sound(microwave_ambient_sound)
+            
+            print("💾 Saving recorded audio...")
+            audio_file = save_audio(current_frames, filename="user_command.wav")
+            print(f"📁 Audio saved as: {audio_file}")
+            
+            # This is the main async call to the brain
+            print("🧠 Sending audio to brain for processing...")
+            response = await brain.process_audio_input(audio_file)
+            print(f"🧠 Brain response received: '{response}'")
+            
+            print("🔄 Preprocessing response for TTS...")
+            original_text, cleaned_text, arduino_tool_positions, mcp_tool_positions, audio = ap.preprocess(response)
+            print(f"🧹 Cleaned text for TTS: '{cleaned_text}'")
+            
+            print("🔇 Stopping ambient sound...")
+            stop_ambient_sound()
+            
+            print("🔔 Playing completion beep...")
+            play_sound(microwave_beep_sound)
+            time.sleep(0.2)
+            
+            # This part is now async and handles speaking + MCP tool execution
+            print("🗣️ Starting speech synthesis and playback...")
+            await ap.process_and_speak(original_text, cleaned_text, arduino_tool_positions, mcp_tool_positions, audio)
+            
+            print(f"🐟 Fish responded: '{response}'")
 
-def main():
-    global beep_sound, microwave_beep_sound, microwave_ambient_sound, p, stream
+            # --- Listen for Follow-up ---
+            print("👂 Listening for follow-up command...")
+            current_frames = listen_and_record(
+                listen_timeout=FOLLOW_UP_LISTEN_TIMEOUT,
+                silence_duration_end=FOLLOW_UP_SILENCE_DURATION,
+                min_record_sec=0.5
+            )
+
+            if current_frames is None:
+                print("⏰ No follow-up detected within timeout.")
+
+    finally:
+        # --- End of Conversation ---
+        print(f"🏁 Conversation ended after {turn_count} turns.")
+        is_recording = False # Allow wake word process to restart listening
+        print("👂 Re-enabling wake word detection...")
+
+
+async def main():
+    global beep_sound, microwave_beep_sound, microwave_ambient_sound, p, stream, ap, brain
     beep_sound, microwave_beep_sound, microwave_ambient_sound = init_sound()
-    brain = FishBrain()
+    
+    # Initialize ActionProcessor
+    ap = ActionProcessor()
+    
+    # Pass the initialized processor to the brain
+    brain = FishBrain(action_processor=ap)
 
     # Initialize PyAudio instance here, but don't open stream yet
     p = pyaudio.PyAudio()
@@ -346,10 +431,21 @@ def main():
     wakeword_thread = Thread(target=wakeword_process, args=(brain,))
     wakeword_thread.daemon = True
     wakeword_thread.start()
+    
     print("Fish Voice Assistant is ready! Make a loud noise to activate.")
+    play_sound(microwave_beep_sound)
+    
+    # Initialize MCP client in the background after a short delay
+    async def delayed_mcp_init():
+        await asyncio.sleep(2)  # Give the system time to fully start
+        await initialize_mcp_background()
+    
+    asyncio.create_task(delayed_mcp_init())
+    
     try:
+        # Keep the main async loop running
         while True:
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
     except KeyboardInterrupt:
         print("Stopping...")
     finally:
@@ -358,10 +454,28 @@ def main():
         if p is not None:
             p.terminate() # Terminate the main PyAudio instance
             print("PyAudio terminated.")
+        await ap.cleanup()
         brain.cleanup()
-        ap.cleanup()
         print("Cleanup complete.")
+
+async def initialize_mcp_background():
+    """Initialize MCP client in the background"""
+    global ap, brain
+    if ap:
+        try:
+            print("🔌 Attempting to connect to Home Assistant in background...")
+            await ap.initialize_mcp_client()
+            if ap.mcp_wrapper:
+                print("✅ Home Assistant connection successful!")
+                # Update the brain with the new tools
+                if brain:
+                    brain.update_tools()
+            else:
+                print("⚠️  Home Assistant connection failed, continuing without it")
+        except Exception as e:
+            print(f"⚠️  Home Assistant background connection error: {e}")
+            print("🐠 Fish will continue to work without Home Assistant features")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

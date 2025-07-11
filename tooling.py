@@ -79,17 +79,32 @@ class Tooling:
 
     def _send_immediate_command(self, motor: int, speed: int, duration: Optional[float] = None):
         if not self.serial_conn or not self.serial_conn.is_open:
-            print("Serial connection lost")
-            return
+            print("Serial connection lost, attempting to reconnect...")
+            try:
+                self._init_connection()
+            except Exception as e:
+                print(f"Failed to reconnect: {e}")
+                return
             
         cmd = f"{motor},{speed}"
-        if duration:
-            cmd += f",{int(duration * 1000)}"
         cmd += "\n"
         
         print(f"Sending command: {cmd.strip()}")
-        self.serial_conn.write(cmd.encode())
-        self.serial_conn.flush()
+        try:
+            self.serial_conn.write(cmd.encode())
+            self.serial_conn.flush()
+        except Exception as e:
+            print(f"Error sending command: {e}")
+            # Try to reconnect on error
+            try:
+                self.serial_conn.close()
+                self._init_connection()
+                self.serial_conn.write(cmd.encode())
+                self.serial_conn.flush()
+                print("Reconnected and sent command successfully")
+            except Exception as reconnect_error:
+                print(f"Failed to reconnect and send command: {reconnect_error}")
+                return
         
         motor_ctrl = self.motors[motor]
         motor_ctrl.speed = speed
@@ -109,7 +124,7 @@ class Tooling:
             return False
             
         if open_mouth != self.mouth_open:
-            self._send_immediate_command(1, 255 if open_mouth else 0)
+            self._send_immediate_command(2, -200 if open_mouth else 0)
             self.mouth_open = open_mouth
             self.last_mouth_move = current_time
             return True
@@ -118,29 +133,14 @@ class Tooling:
     def run_tool(self, tool: str) -> bool:
         current_time = time.time()
         
-        if tool.startswith("Mouth"):
-            return self.move_mouth(tool == "MouthOpen")
-        
         if tool in self.cooldowns:
-            if current_time - self.last_actions[tool] < self.cooldowns[tool]:
+            if current_time - self.last_actions.get(tool, 0) < self.cooldowns.get(tool, 0.1):
                 return False
             self.last_actions[tool] = current_time
         
-        if tool == "TailFlop":
-            print(f"Executing TailFlop at {time.time()}")
-            self._send_immediate_command(3, 255, 0.3)
-            return True
-            
-        elif tool == "HeadFlop":
-            self._send_immediate_command(2, 255, 0.2)
-            return True
-            
-        elif tool == "MoveHead&&Outward":
-            self._send_immediate_command(2, 255)
-            return True
-            
-        elif tool == "MoveHead&&Inward":
-            self._send_immediate_command(2, 0)
+        if tool == "MoveTail":
+            print(f"Executing MoveTail at {time.time()}")
+            self._send_immediate_command(1, 255, 0.5)
             return True
             
         print(f"Unknown tool: {tool}")
@@ -150,9 +150,21 @@ class Tooling:
         tools = {}
         clean_text = text
         
-        for tool in re.findall(r"<<(.*?)>>", text):
-            tools[tool] = text.find(f"<<{tool}>>")
-            clean_text = clean_text.replace(f"<<{tool}>>", "")
+        # Define Arduino tools that this class should handle
+        arduino_tools = ["MoveTail", "HeadFlop", "TailFlop", "MoveHead"]
+        
+        # Find all tool tokens in the text
+        for match in re.finditer(r"<<(.*?)>>", text):
+            full_token = match.group(0)  # <<TurnOn||Dirk>>
+            tool_content = match.group(1)  # TurnOn||Dirk
+            tool_name = tool_content.split("||")[0] if "||" in tool_content else tool_content
+            
+            # Only track Arduino tools for execution
+            if tool_name in arduino_tools:
+                tools[tool_content] = match.start()
+            
+            # Clean ALL tool tokens from the text (Arduino + Home Assistant)
+            clean_text = clean_text.replace(full_token, "")
 
         print(f"Extracted tools: {tools}")
         return clean_text, tools

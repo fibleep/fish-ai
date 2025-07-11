@@ -11,6 +11,7 @@ dependencies = [
     "google-generativeai>=0.8.4",
     "ipykernel>=6.29.5",
     "librosa>=0.11.0",
+    "mcp[cli]>=1.9.4",
     "openwakeword>=0.6.0",
     "pio>=0.0.3",
     "pvporcupine>=3.0.5",
@@ -23,4 +24,5 @@ dependencies = [
     "serial>=0.0.97",
     "sounddevice>=0.5.1",
     "whisperx>=3.3.1",
+    "yt-dlp>=2025.4.30",
 ]
